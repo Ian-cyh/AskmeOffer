@@ -1,5 +1,6 @@
 import uuid
 import re
+import unicodedata
 
 import httpx
 from fastapi import APIRouter, UploadFile, File, Form
@@ -31,6 +32,25 @@ class FetchProfessorRequest(BaseModel):
     page_text: str = ""   # Browser-scraped page text (avoids server-side CORS/firewall issues)
 
 
+def _sanitize_page_text(text: str) -> str:
+    """Remove control chars, null bytes, and other problematic chars from scraped page text."""
+    # Remove null bytes
+    text = text.replace("\x00", "")
+    # Keep only printable chars + common whitespace (\n, \r, \t)
+    text = "".join(
+        ch for ch in text
+        if ch in ("\n", "\r", "\t")
+        or not unicodedata.category(ch).startswith("C")
+    )
+    # Remove HTML entities that might have survived
+    text = re.sub(r"&[a-zA-Z]+;", " ", text)
+    text = re.sub(r"&#\d+;", " ", text)
+    # Collapse excessive whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 @router.post("/fetch_professor")
 async def fetch_professor(req: FetchProfessorRequest):
     """Extract professor info from page text or URL via LLM."""
@@ -51,7 +71,7 @@ async def fetch_professor(req: FetchProfessorRequest):
         except Exception:
             text = ""   # Will fall through to URL-only LLM lookup
 
-    text = text[:4000]
+    text = _sanitize_page_text(text)[:4000]
 
     system = (
         "你是一名信息提取助手，专门处理高校教师主页信息。"
@@ -77,8 +97,19 @@ async def fetch_professor(req: FetchProfessorRequest):
     try:
         info = await collect_chat(system, [{"role": "user", "content": user_content}])
         return {"info": info}
-    except Exception as e:
-        return {"error": f"LLM 提取失败：{e}"}
+    except Exception:
+        # Retry with URL-only if page text caused the error
+        if text:
+            try:
+                fallback_content = (
+                    f"请根据以下导师主页 URL，结合你的知识提取该导师的信息。"
+                    f"注意：只输出你确定知道的信息，不要捏造。\nURL：{req.url}"
+                )
+                info = await collect_chat(system, [{"role": "user", "content": fallback_content}])
+                return {"info": info}
+            except Exception as e2:
+                return {"error": f"LLM 提取失败：{e2}"}
+        return {"error": "LLM 提取失败，请检查 URL 是否正确"}
 
 
 DIFFICULTY_MAP = {

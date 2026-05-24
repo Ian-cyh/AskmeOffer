@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -15,13 +15,23 @@ import { FULL_COURSE_TEST_RECORDS } from "@/lib/fullCourseTest";
 import {
   Play, Send, RotateCcw, BookOpen, Trash2, ChevronDown, ChevronUp,
   CheckCircle, XCircle, AlertTriangle, HelpCircle, History, MessageSquare,
-  Lightbulb, FileText, Map, Mic, MicOff, Volume2,
+  Lightbulb, FileText, Map, Mic, MicOff, Volume2, X,
 } from "lucide-react";
 
 const API_BASE = () =>
   typeof window === "undefined" ? "http://localhost:8000" : `http://${window.location.hostname}:8000`;
 
 interface Message { role: "user" | "assistant"; content: string; }
+
+const COURSE_IN_PROGRESS_KEY = "course-exam-in-progress";
+interface InProgressCourseData {
+  sessionId: string;
+  messages: Message[];
+  subject: string;
+  examMode: "text" | "voice";
+  examTtsVoice: string;
+  savedAt: string;
+}
 
 const SUBJECTS = [
   "高等数学/微积分", "线性代数", "概率论与数理统计",
@@ -117,6 +127,10 @@ export default function CoursesPage() {
   // auto-start recording after AI finishes responding (voice mode)
   const autoListenRef = useRef(true);
 
+  // Resume modal state
+  const [showResumeModal, setShowResumeModal] = useState(false);
+  const [savedCourseData, setSavedCourseData] = useState<InProgressCourseData | null>(null);
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -145,6 +159,14 @@ export default function CoursesPage() {
 
   useEffect(() => { refreshNotebook(); fetchKnowledgeMap(); }, []);
 
+  /** Shared cleanup: stop all audio, recording */
+  const cleanupAll = useCallback(() => {
+    if (examAudioRef.current) { examAudioRef.current.pause(); examAudioRef.current = null; }
+    if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    if (mediaRecorderRef.current?.state !== "inactive") mediaRecorderRef.current?.stop();
+  }, []);
+
   // Pause audio & stop recording when user switches away
   useEffect(() => {
     const handleVisibility = () => {
@@ -159,6 +181,54 @@ export default function CoursesPage() {
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, []);
+
+  // Check for in-progress exam on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(COURSE_IN_PROGRESS_KEY);
+      if (raw) {
+        const data: InProgressCourseData = JSON.parse(raw);
+        if (data.messages && data.messages.length > 1) {
+          setSavedCourseData(data);
+          setShowResumeModal(true);
+        }
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Auto-save in-progress exam whenever messages change
+  useEffect(() => {
+    if (phase !== "exam" || messages.length < 2) return;
+    const data: InProgressCourseData = {
+      sessionId, messages, subject: effectiveSubject,
+      examMode, examTtsVoice,
+      savedAt: new Date().toLocaleString("zh-CN"),
+    };
+    try { localStorage.setItem(COURSE_IN_PROGRESS_KEY, JSON.stringify(data)); } catch { /* ignore */ }
+  }, [messages, phase, sessionId, effectiveSubject, examMode, examTtsVoice]);
+
+  // Cleanup on component unmount (Next.js client-side navigation)
+  useEffect(() => {
+    return () => { cleanupAll(); };
+  }, [cleanupAll]);
+
+  const resumeExam = () => {
+    if (!savedCourseData) return;
+    setMessages(savedCourseData.messages);
+    setSessionId(savedCourseData.sessionId);
+    setSubject(savedCourseData.subject);
+    setExamMode(savedCourseData.examMode as "text" | "voice");
+    setExamTtsVoice(savedCourseData.examTtsVoice);
+    setPhase("exam");
+    setShowResumeModal(false);
+    setSavedCourseData(null);
+  };
+
+  const discardSavedExam = () => {
+    try { localStorage.removeItem(COURSE_IN_PROGRESS_KEY); } catch { /* ignore */ }
+    setShowResumeModal(false);
+    setSavedCourseData(null);
+  };
 
   const loadFullCourseTest = () => {
     const existing = loadCourseRecords();
@@ -400,6 +470,7 @@ export default function CoursesPage() {
         refreshNotebook();
         fetchKnowledgeMap();
         setPhase("feedback");
+        try { localStorage.removeItem(COURSE_IN_PROGRESS_KEY); } catch { /* ignore */ }
       }
     } catch {
       alert("反馈生成失败");
@@ -612,6 +683,22 @@ export default function CoursesPage() {
   return (
     <div className="p-8 max-w-4xl space-y-6">
       <PageHeader title="专业课考核" description="AI 考官 · 知识点追问 · 错题本 · AI 答疑" />
+
+      {/* Resume modal */}
+      {showResumeModal && savedCourseData && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-xl p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-bold mb-2">发现未完成的考核</h3>
+            <p className="text-sm text-muted mb-1">保存时间：{savedCourseData.savedAt}</p>
+            <p className="text-sm text-muted mb-1">科目：{savedCourseData.subject}</p>
+            <p className="text-sm text-muted mb-4">已对话 {savedCourseData.messages.length} 条，{savedCourseData.examMode === "voice" ? "语音" : "文字"}模式</p>
+            <div className="flex gap-3">
+              <Button onClick={resumeExam}><Play size={14} /> 继续考核</Button>
+              <Button variant="secondary" onClick={discardSavedExam}><X size={14} /> 放弃，重新开始</Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex gap-1 border-b border-border overflow-x-auto">
         {([

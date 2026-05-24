@@ -84,4 +84,8 @@ async def collect_chat(
             headers=_headers(),
         )
         data = resp.json()
+        if "choices" not in data:
+            # API returned an error object — surface it clearly
+            err = data.get("error", data)
+            raise RuntimeError(f"LLM API error: {err}")
         return data["choices"][0]["message"]["content"]

@@ -201,12 +201,24 @@ export default function InterviewPage() {
     try { localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify(data)); } catch { /* ignore */ }
   }, [messages, started, showFeedback, sessionId, difficulty, mode, ttsVoice, interviewerInfo]);
 
+  /** Shared cleanup: stop all audio, recording, WebSocket */
+  const cleanupAll = useCallback(() => {
+    if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
+    window.speechSynthesis?.cancel();
+    if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    recognitionRef.current?.stop();
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+  }, []);
+
   // Pause audio & stop recording when user switches away from the page
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === "hidden") {
         if (_currentAudio) _currentAudio.pause();
-        // Stop any ongoing recording
         if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
         if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
@@ -220,6 +232,11 @@ export default function InterviewPage() {
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, []);
+
+  // Cleanup on component unmount (Next.js client-side navigation)
+  useEffect(() => {
+    return () => { cleanupAll(); };
+  }, [cleanupAll]);
 
   // Warn on page close/navigation if interview is in progress
   useEffect(() => {
@@ -376,7 +393,7 @@ export default function InterviewPage() {
     try {
       await fetchStream(
         "/api/interview/start",
-        { profile, difficulty, session_id: newSessionId, past_memory: pastMemory, asr_mode: false },
+        { profile, difficulty, session_id: newSessionId, past_memory: pastMemory, asr_mode: false, interviewer_info: interviewerInfo },
         (chunk) => { assistantContent += chunk; setMessages([{ role: "assistant", content: assistantContent }]); },
         () => setLoading(false),
       );

@@ -147,5 +147,32 @@ export const demoProfile: UserProfile = {
     },
   ],
   recommendations: [],
-  target_schools: [],
+  target_schools: [
+    {
+      id: "ts-001",
+      school_name: "北京大学",
+      department: "计算机学院",
+      program: "计算机科学与技术",
+      advisor_name: "朱松纯",
+      advisor_direction: "计算机视觉、认知推理、具身智能（Embodied AI）",
+      advisor_papers:
+        "创立 UCLA 统计视觉与学习实验室（SVIL），发表 Science、PNAS、TPAMI 等顶级论文 300+ 篇，h 指数 80+，现任北京通用人工智能研究院（BIGAI）院长",
+      contact_status: "已投申请",
+      notes:
+        "主页：https://www.stat.ucla.edu/~sczhu/；研究院主页：https://bigai.ai。方向与自动驾驶感知+LLM Agent 结合较好，可重点准备认知计算与 World Model 相关问题。",
+    },
+    {
+      id: "ts-002",
+      school_name: "清华大学",
+      department: "电子工程系",
+      program: "信息与通信工程",
+      advisor_name: "张亚勤",
+      advisor_direction: "人工智能、自动驾驶、边缘计算与物联网",
+      advisor_papers:
+        "IEEE Fellow、中国工程院外籍院士，曾任微软亚洲研究院院长、百度总裁，现任清华大学智能产业研究院（AIR）院长",
+      contact_status: "意向申请",
+      notes:
+        "主页：https://air.tsinghua.edu.cn；研究院汇聚产业界资源，适合对落地应用感兴趣的同学，可关注其自动驾驶感知与决策方向。",
+    },
+  ],
 };

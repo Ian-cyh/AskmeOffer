@@ -26,42 +26,64 @@ _COMMON_ABBRS = {
 
 
 def preprocess_tts(text: str) -> str:
-    """Convert ALL-CAPS abbreviations to space-separated letters for natural reading.
-    
-    e.g. "DOE" → "D O E"，"GPA" → "G P A"
-    保留小写单词不变，只处理 2+ 个连续大写字母的词（含数字后缀如 GPT-4）。
+    """Clean text for TTS: strip markdown artifacts and expand abbreviations.
+
+    1. Remove Chinese curly quotes and other non-speech symbols
+    2. Convert ALL-CAPS abbreviations to space-separated letters for natural reading
+       e.g. "DOE" → "D O E"，"GPA" → "G P A"
     """
+    # 去除中文引号（朗读时会念出"左引号""右引号"）
+    text = text.replace('\u201c', '').replace('\u201d', '')  # "" 
+    text = text.replace('\u2018', '').replace('\u2019', '')  # ''
+    # 去除常见 Markdown 符号（**加粗**、`代码`、#标题 等）
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)   # *bold*/**bold**
+    text = re.sub(r'`{1,3}[^`]*`{1,3}', '', text)           # `code` / ```block```
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)  # ## heading
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)              # images
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)   # links → text
+    # 去除 LaTeX 公式（不适合朗读）
+    text = re.sub(r'\$\$[^$]+\$\$', '（公式）', text, flags=re.DOTALL)
+    text = re.sub(r'\$[^$\n]+\$', '（公式）', text)
+    # 去除多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
     def expand_abbr(m: re.Match) -> str:
         word = m.group(0)
-        # 只处理全大写（允许末尾有数字/连字符，如 GPT-4、V100）
         core = re.match(r"^([A-Z]{2,})", word)
         if not core:
             return word
         letters = core.group(1)
         suffix = word[len(letters):]
-        # 逐字母加空格，末尾数字原样拼接
         spelled = " ".join(letters)
         return spelled + (suffix if suffix else "")
 
-    # 匹配 2 个以上连续大写字母（不被小写字母前缀修饰，可后跟 -数字 等）
-    # 用 (?<![A-Za-z]) 代替 \b，避免中文字符被视为 \w 导致边界失效
     return re.sub(r"(?<![A-Za-z])[A-Z]{2,}[\w-]*", expand_abbr, text)
 
 
-async def synthesize_edge(text: str) -> AsyncIterator[bytes]:
+# 可选音色列表（供前端展示）
+AVAILABLE_VOICES = [
+    {"id": "zh-CN-YunxiNeural",   "name": "云希（温和男声）", "desc": "温和亲切，适合常规面试"},
+    {"id": "zh-CN-YunjianNeural", "name": "云健（严肃男声）", "desc": "严肃专业，适合压力面试"},
+    {"id": "zh-CN-YunyangNeural", "name": "云扬（播报男声）", "desc": "沉稳权威，适合正式场合"},
+    {"id": "zh-CN-XiaoxiaoNeural","name": "晓晓（活泼女声）", "desc": "亲切活泼，适合轻松面试"},
+    {"id": "zh-CN-XiaoyiNeural",  "name": "晓伊（温柔女声）", "desc": "温柔细腻，适合学术交流"},
+]
+
+
+async def synthesize_edge(text: str, voice: str = VOICE) -> AsyncIterator[bytes]:
     """Stream MP3 audio chunks from Edge TTS."""
     processed = preprocess_tts(text)
-    communicate = edge_tts.Communicate(processed, voice=VOICE, rate=RATE, pitch=PITCH)
+    communicate = edge_tts.Communicate(processed, voice=voice, rate=RATE, pitch=PITCH)
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             yield chunk["data"]
 
 
-async def synthesize_edge_full(text: str) -> bytes:
+async def synthesize_edge_full(text: str, voice: str = VOICE) -> bytes:
     """Get complete MP3 audio from Edge TTS."""
     processed = preprocess_tts(text)
     buf = io.BytesIO()
-    communicate = edge_tts.Communicate(processed, voice=VOICE, rate=RATE, pitch=PITCH)
+    communicate = edge_tts.Communicate(processed, voice=voice, rate=RATE, pitch=PITCH)
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             buf.write(chunk["data"])

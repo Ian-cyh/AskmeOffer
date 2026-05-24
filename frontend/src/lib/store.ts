@@ -36,9 +36,17 @@ export interface InterviewRecord {
   messages: { role: "user" | "assistant"; content: string }[];
   feedback: {
     summary: string;
-    questions: { question: string; answer: string; evaluation: string }[];
+    questions: {
+      question: string;
+      answer: string;
+      evaluation: string;
+      expression_advice?: string;
+      suggested_answer?: string;
+      score?: number;
+    }[];
     strengths: string[];
     improvements: string[];
+    expression_summary?: string;
     overallScore: string;
   } | null;
 }
@@ -77,6 +85,7 @@ export interface CourseKnowledgeResult {
   status: "mastered" | "weak" | "not_tested";
   score: number;
   detail: string;
+  expression_advice?: string;
   suggested_answer?: string;
   wrong_answer_summary?: string;
 }
@@ -92,6 +101,7 @@ export interface CourseRecord {
     knowledge_results: CourseKnowledgeResult[];
     overall_score: number;
     weak_points: string[];
+    expression_summary?: string;
     next_focus: string;
   } | null;
 }

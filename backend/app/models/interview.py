@@ -28,3 +28,7 @@ class InterviewContext(BaseModel):
     past_memory: str = ""
     # Whether input came from ASR (affects error tolerance)
     asr_mode: bool = False
+    # Edge TTS voice ID selected by user
+    tts_voice: str = "zh-CN-YunxiNeural"
+    # Optional interviewer persona (e.g., professor info)
+    interviewer_info: str = ""

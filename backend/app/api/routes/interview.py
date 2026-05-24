@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.models.profile import UserProfile
-from app.services.llm.client import stream_chat
+from app.services.llm.client import stream_chat, collect_chat
 from app.services.interview.context import (
     get_or_create_session,
     reset_session,
@@ -13,7 +13,15 @@ from app.services.interview.context import (
     ASR_NOTICE,
 )
 
+from app.services.voice.edge_tts_service import AVAILABLE_VOICES
+
 router = APIRouter()
+
+
+@router.get("/voices")
+async def list_voices():
+    """Return available TTS voices."""
+    return {"voices": AVAILABLE_VOICES}
 
 
 DIFFICULTY_MAP = {
@@ -165,22 +173,34 @@ async def upload_material(
 
 # --- Feedback Generation ---
 
-FEEDBACK_SYSTEM = """你是一位专业的面试评估专家。请根据以下面试对话记录，生成一份结构化的面试反馈报告。
+FEEDBACK_SYSTEM = """你是一位资深的保研面试辅导专家，需要从"面试评委听者的视角"给候选人写一份深度反馈。
+面试者说话时感觉和听者听到的效果往往不同——你的任务是帮候选人意识到听者的真实感受。
 
 请严格按以下 JSON 格式输出（不要输出其他内容）：
 {
-  "summary": "整体面试表现的一段话总结（100字以内）",
+  "summary": "整体面试表现总结（120字以内，包含整体印象和核心建议）",
   "questions": [
     {
       "question": "面试官提出的问题",
       "answer": "候选人的回答要点摘要",
-      "evaluation": "对该回答的评价（好/一般/需改进 + 具体点评）"
+      "evaluation": "对该回答的准确性评价",
+      "expression_advice": "语言表达优化建议：从听者角度指出表述问题（如太啰嗦、逻辑不清、缺少结论先行、专业术语使用不当等），并给出具体的改进话术示例",
+      "suggested_answer": "参考回答或改进方向。规则：(1)基础概念/原理类问题→直接给出准确的标准答案和关键知识点；(2)项目细节/个人经历类问题→不要编造细节，而是指出回答中缺少哪些关键信息，告诉候选人应该去回顾/准备哪些具体内容（如'建议回顾你项目中XX模块的具体实现细节和性能数据'）；(3)开放性/动机类问题→给出回答框架和表达策略建议",
+      "score": "A/B/C/D"
     }
   ],
   "strengths": ["优势1", "优势2"],
-  "improvements": ["待提升点1", "待提升点2"],
+  "improvements": ["待提升点1（具体可执行的建议）", "待提升点2"],
+  "expression_summary": "整体语言表达点评（50-100字）：从听者感受角度总结候选人的表达习惯问题和改进方向，例如是否存在口头禅过多、回答冗长、缺乏结构感、语气不够自信等",
   "overallScore": "A/B/C/D 评级 + 一句话说明"
-}"""
+}
+
+重要原则：
+- 对于基础知识和概念性问题（如算法原理、数学推导、CS基础），在 suggested_answer 中直接给出完整准确的标准答案
+- 对于项目经历、实习经验等个人细节，不要凭空编造，而是告诉候选人"你的回答缺少了XX信息，建议去查阅/准备XX"
+- expression_advice 要从"评委听到你的回答时的真实感受"出发，而非简单说"可以更好"
+- 给出的改进话术要具体到可以直接使用的句子模板
+- 禁止使用中文引号""，举例口头禅请用反引号包裹如 `其实`、`就是`"""
 
 
 class FeedbackRequest(BaseModel):
@@ -221,6 +241,203 @@ async def generate_feedback(req: FeedbackRequest):
         return {"ok": True, "feedback": feedback}
     except json_mod.JSONDecodeError:
         return {"ok": True, "feedback": {"summary": result, "questions": [], "strengths": [], "improvements": [], "overallScore": "未评级"}}
+
+
+# --- Feedback Follow-up Chat ---
+
+FEEDBACK_CHAT_SYSTEM = """你是一位资深的保研面试辅导教练，候选人刚完成一次模拟面试，你给了他反馈报告，现在他正在就反馈内容向你追问。
+
+你的角色原则：
+1. 对于基础概念/原理类追问（如"XXX到底是什么""YY算法怎么推导"）：直接给出清晰、准确、有深度的解答
+2. 对于项目细节类追问（如"我应该怎么描述我的XX项目"）：不要编造细节，而是引导候选人回忆和整理自己的信息，告诉他应该准备哪些关键点
+3. 对于表达技巧类追问（如"怎么组织语言""怎么回答压力面问题"）：给出具体、可操作的话术模板和策略
+4. 回答要简洁实用，像一个有经验的学长在帮忙辅导
+5. 使用 Markdown 格式，公式用 LaTeX：$...$ 行内，$$...$$ 独立公式
+6. 禁止使用中文引号""，举例请用反引号
+
+以下是本次面试的反馈报告和对话记录，请基于此回答候选人的追问。"""
+
+
+class FeedbackChatRequest(BaseModel):
+    feedback_summary: str
+    interview_history: list[dict] = []
+    chat_history: list[dict] = []
+    user_message: str
+
+
+@router.post("/feedback_chat")
+async def feedback_chat(req: FeedbackChatRequest):
+    """Interactive follow-up chat about interview feedback."""
+    context = FEEDBACK_CHAT_SYSTEM
+    if req.feedback_summary:
+        context += f"\n\n=== 面试反馈报告 ===\n{req.feedback_summary}"
+    if req.interview_history:
+        conversation = "\n".join(
+            f"{'面试官' if m['role'] == 'assistant' else '候选人'}：{m['content']}"
+            for m in req.interview_history[:30]
+        )
+        context += f"\n\n=== 面试对话记录 ===\n{conversation}"
+
+    messages = [*req.chat_history, {"role": "user", "content": req.user_message}]
+
+    async def generate():
+        async for chunk in stream_chat(context, messages=messages):
+            yield chunk
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# --- Historical Interview Summary ---
+
+SUMMARY_SYSTEM = """你是一位保研面试辅导专家，请根据候选人的多次模拟面试记录，生成一份综合分析报告。
+
+请严格按以下 JSON 格式输出（不要输出其他内容）：
+{
+  "overall_trend": "整体进步趋势（2-3句话描述候选人从第一次到最近一次的变化）",
+  "persistent_strengths": ["持续表现好的方面1", "持续表现好的方面2"],
+  "persistent_weaknesses": ["反复出现的薄弱点1", "反复出现的薄弱点2"],
+  "improvement_areas": ["已有明显进步的方面1"],
+  "priority_actions": ["最需要优先改进的事项1（具体可执行）", "最需要优先改进的事项2"],
+  "expression_pattern": "语言表达方面的整体模式和建议（2-3句话）",
+  "readiness_assessment": "当前面试准备程度评估（1-3句话，包含是否可以开始真实面试的判断）"
+}"""
+
+
+class SummaryRequest(BaseModel):
+    records: list[dict]
+
+
+@router.post("/history_summary")
+async def generate_history_summary(req: SummaryRequest):
+    """Generate a comprehensive summary across multiple interview records."""
+    import json as json_mod
+
+    if len(req.records) < 2:
+        return {"error": "至少需要 2 次面试记录才能生成汇总分析"}
+
+    parts = []
+    for i, r in enumerate(req.records[:10]):
+        fb = r.get("feedback") or {}
+        if not isinstance(fb, dict) or not fb:
+            continue
+        strengths = fb.get("strengths") or []
+        improvements = fb.get("improvements") or []
+        parts.append(
+            f"[第{i+1}次 — {r.get('date','?')}，难度：{r.get('difficulty','?')}]\n"
+            f"评级：{fb.get('overallScore','?')}\n"
+            f"总结：{fb.get('summary','')}\n"
+            f"优势：{', '.join(str(s) for s in strengths)}\n"
+            f"待提升：{', '.join(str(s) for s in improvements)}\n"
+            f"表达总评：{fb.get('expression_summary', '无')}"
+        )
+
+    if len(parts) < 1:
+        return {"error": "没有包含反馈的面试记录，无法生成汇总"}
+
+    combined = "\n\n".join(parts)
+
+    try:
+        result = await collect_chat(
+            SUMMARY_SYSTEM,
+            user_message=f"候选人的 {len(parts)} 次面试记录：\n\n{combined}",
+        )
+
+        cleaned = result.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: cleaned.rfind("```")]
+        try:
+            summary = json_mod.loads(cleaned.strip())
+            return {"ok": True, "summary": summary}
+        except json_mod.JSONDecodeError:
+            return {"ok": True, "summary": {"overall_trend": result, "persistent_strengths": [], "persistent_weaknesses": [], "improvement_areas": [], "priority_actions": [], "expression_pattern": "", "readiness_assessment": ""}}
+    except Exception as e:
+        return {"error": f"汇总生成失败：{e}"}
+
+
+# --- Code Challenge ---
+
+import json as _json
+
+CODE_CHALLENGE_SYSTEM = """你是一位保研面试官，现在要给候选人出一道手撕代码题。根据候选人的研究背景（计算机/通信/AI方向），选择一道适合保研面试的编程题。
+
+要求：
+1. 难度相当于 LeetCode 中等偏易，适合 15-20 分钟内完成
+2. 考察基础数据结构或算法（排序、字符串、DP、二叉树、图等）
+3. 题目用中文描述，包含输入输出格式和示例
+4. starter_code 只提供骨架（输入读取框架 + TODO 注释），不能包含任何解题逻辑
+
+严格按 JSON 格式输出：
+{
+  "title": "题目标题",
+  "description": "题目完整描述（含输入输出格式、数据范围）",
+  "examples": [{"input": "示例输入", "output": "示例输出", "explanation": "解释（可选）"}],
+  "language": "python",
+  "starter_code": "# 骨架代码\\nimport sys\\ninput = sys.stdin.readline\\n\\n# TODO: 实现你的解法\\nn = int(input())\\n"
+}"""
+
+CODE_REVIEW_SYSTEM = """你是一位经验丰富的保研面试官，正在评审候选人提交的手撕代码。
+
+请从面试官视角重点评估：
+1. **代码正确性** — 逻辑是否正确，能否通过所有测试用例
+2. **时间/空间复杂度** — 分析并指出是否有更优解
+3. **代码规范性** — 命名、注释、代码结构
+4. **边界情况** — 是否处理了空输入、极值等边界
+5. **面试评价** — 该代码在面试中能否通过
+
+请用 Markdown 格式给出详细评审，包括：
+- 总体评价（能否过面试关）
+- 具体问题（每条用 Markdown 列表）
+- 改进建议（含示例代码片段）
+- 时空复杂度分析（用 $O(...)$ LaTeX 格式）
+- 综合评分（0-100分）"""
+
+
+class CodeChallengeRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/code_challenge")
+async def get_code_challenge(req: CodeChallengeRequest):
+    """Generate a coding challenge tailored to the candidate's background."""
+    ctx = get_or_create_session(req.session_id)
+    profile_hint = ctx.profile_summary[:600] if ctx.profile_summary else "理工科学生，计算机/通信方向"
+
+    try:
+        result = await collect_chat(
+            CODE_CHALLENGE_SYSTEM,
+            user_message=f"候选人背景：\n{profile_hint}\n\n请出一道适合该候选人的手撕代码题",
+            timeout=60.0,
+        )
+        cleaned = result.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: cleaned.rfind("```")]
+        challenge = _json.loads(cleaned.strip())
+        return {"ok": True, "challenge": challenge}
+    except _json.JSONDecodeError:
+        return {"ok": True, "challenge": {"title": "题目生成失败", "description": result, "examples": [], "language": "python", "starter_code": ""}}
+    except Exception as e:
+        return {"error": f"题目生成失败：{e}"}
+
+
+class CodeReviewRequest(BaseModel):
+    session_id: str
+    problem: str
+    code: str
+    language: str = "python"
+
+
+@router.post("/code_review")
+async def review_code(req: CodeReviewRequest):
+    """Stream a code review for the submitted code."""
+    messages = [{"role": "user", "content": f"题目描述：\n{req.problem}\n\n候选人提交的代码（{req.language}）：\n```{req.language}\n{req.code}\n```"}]
+    return StreamingResponse(
+        stream_chat(CODE_REVIEW_SYSTEM, messages=messages),
+        media_type="text/event-stream",
+    )
 
 
 # --- Session Info ---

@@ -11,7 +11,8 @@ import { AcademicForm } from "@/components/profile/AcademicForm";
 import { ExperienceForm } from "@/components/profile/ExperienceForm";
 import { SchoolsManager } from "@/components/profile/SchoolsManager";
 import { ResumeGenerator } from "@/components/profile/ResumeGenerator";
-import { Save, RotateCcw, User, GraduationCap, Briefcase, School, FileText } from "lucide-react";
+import { InterviewHistory } from "@/components/profile/InterviewHistory";
+import { Save, RotateCcw, User, GraduationCap, Briefcase, School, FileText, Mic } from "lucide-react";
 
 const PROFILE_TABS = [
   { key: "basic", label: "基本信息", icon: <User size={16} /> },
@@ -19,6 +20,7 @@ const PROFILE_TABS = [
   { key: "experience", label: "经历", icon: <Briefcase size={16} /> },
   { key: "schools", label: "目标院校", icon: <School size={16} /> },
   { key: "generate", label: "材料生成", icon: <FileText size={16} /> },
+  { key: "interviews", label: "面试记录", icon: <Mic size={16} /> },
 ];
 
 export default function ProfilePage() {
@@ -98,6 +100,10 @@ export default function ProfilePage() {
 
       {activeTab === "generate" && (
         <ResumeGenerator profile={profile} />
+      )}
+
+      {activeTab === "interviews" && (
+        <InterviewHistory />
       )}
     </div>
   );

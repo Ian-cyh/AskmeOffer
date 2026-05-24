@@ -3,3 +3,7 @@ uvicorn[standard]
 pydantic
 python-dotenv
 httpx
+websockets
+python-multipart
+edge-tts
+pydub

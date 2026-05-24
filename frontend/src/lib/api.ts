@@ -1,4 +1,11 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+function getApiBase() {
+  if (process.env.NEXT_PUBLIC_API_BASE) return process.env.NEXT_PUBLIC_API_BASE;
+  if (typeof window === "undefined") return "http://localhost:8000";
+  // 自动用当前浏览器访问的 hostname，后端端口 8000
+  return `http://${window.location.hostname}:8000`;
+}
+
+const API_BASE = getApiBase();
 
 export async function fetchStream(
   endpoint: string,

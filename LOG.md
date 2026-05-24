@@ -145,12 +145,104 @@
   - 中文能力优秀，适合保研场景（简历/个人陈述/面试均为中文）
 - **结论 / 下一步**：需要在 `.env` 中配置实际的 DeepSeek API Key，然后测试端到端流程
 
-### [XX:XX] 端到端联调测试
+### [10:00] 端到端联调测试
 
 - **做了什么**：
+  - 配置 DeepSeek API Key 到 `backend/.env`
+  - 修复前端 API_BASE 动态获取问题（远程服务器通过 `window.location.hostname` 动态推断后端地址）
+  - 预填 Demo 数据到 localStorage（从用户 PDF 简历中提取）
+  - 优化简历/个人陈述生成 Prompt（仿照用户 PDF 排版格式）
+- **遇到什么问题**：前端在远程服务器访问时默认用 localhost:8000 导致请求失败
+- **怎么解决的**：修改 `frontend/src/lib/api.ts`，用 `window.location.hostname` 动态推断后端地址
+- **结论 / 下一步**：简历和个人陈述 SSE 流式生成功能全部跑通
+
+### [10:30] 面试模块重构 — 四大升级
+
+- **做了什么**：
+  1. **自动抓取个人信息**：面试启动时自动从前端 localStorage 读取完整 UserProfile（包括基本信息、课程成绩、项目经历、竞赛论文、学生工作、推荐信、目标院校），通过 `build_profile_summary()` 生成结构化摘要传给 LLM，面试官能基于**所有已填信息**提问
+  2. **文件上传支持**：新增 `/api/interview/upload` 端点，支持上传补充材料（简历、项目文档、论文等），文本内容自动解析并注入面试上下文
+  3. **语音面试 Pipeline**：
+     - 前端：MediaRecorder 录音 → PCM 转换 → WebSocket 发送
+     - 后端 WebSocket → 阿里云 Paraformer ASR（语音→文字）→ DeepSeek LLM（理解+生成）→ 阿里云 CosyVoice TTS（文字→语音）→ 音频流回传
+     - 前端：AudioContext 实时播放
+  4. **全局上下文维护**：新增 `InterviewContext` 模型，后端内存维护每个 session 的完整状态：
+     - 完整对话历史 `history`
+     - 用户资料摘要 `profile_summary`
+     - 上传材料 `uploaded_materials`
+     - 面试统计（已问问题数、已覆盖话题、发现的强弱项）
+     - 面试官内部笔记 `interviewer_notes`
+
+- **新增/修改文件**：
+  - `backend/app/models/interview.py` — InterviewContext 数据模型
+  - `backend/app/services/interview/context.py` — Session 存储 + Profile 摘要构建
+  - `backend/app/api/routes/interview.py` — 全部重写（/start、/chat、/upload、/session）
+  - `backend/app/api/routes/voice.py` — WebSocket 语音面试端点
+  - `backend/app/services/voice/asr.py` — Paraformer ASR 客户端
+  - `backend/app/services/voice/tts.py` — CosyVoice TTS 客户端
+  - `backend/app/services/llm/client.py` — 新增 `collect_chat()` 非流式接口
+  - `backend/app/core/config.py` — 新增 DashScope 配置
+  - `frontend/src/app/interview/page.tsx` — 全部重写（文字面试 + 语音面试 + 文件上传）
+
+- **技术决策**：
+  - **语音 Pipeline 选择 ASR+LLM+TTS 分离架构**：而非端到端语音大模型，因为 DeepSeek 在面试场景的推理、追问、上下文理解能力远强于纯语音模型
+  - **ASR 选 Paraformer**：阿里云百炼的中文实时语音识别，延迟低、中文识别率高
+  - **TTS 选 CosyVoice**：阿里云百炼的语音合成，音色自然、支持流式输出
+  - **上下文维护在后端**：而非前端，确保语音面试和文字面试共享同一份上下文
+
+- **结论 / 下一步**：文字面试已可测试（自动读取完整个人信息）。语音面试需要配置阿里云 DashScope API Key 后测试。
+
+### [11:03] 语音面试问题排查 — 卡死在"发送语音中"
+
+- **做了什么**：用户反馈语音面试发送语音时间很长，一直卡住
 - **遇到什么问题**：
-- **怎么解决的**：
-- **结论 / 下一步**：
+  - 后端日志出现 `HTTP 401 Unauthorized`，因为没有配置 `DASHSCOPE_API_KEY`
+  - 原 Pipeline（浏览器 webm→PCM + 阿里云 Paraformer ASR + DeepSeek LLM + CosyVoice TTS）三次网络往返，成功也需 5-10 秒
+  - 出错后没有 catch 处理，前端永远等待
+- **怎么解决的**：完全重构语音 Pipeline
+  - **ASR 改为浏览器 SpeechRecognition**：Chrome 内置，底层走 Google 云端识别，中文准确率高，零配置，本地完成无网络往返
+  - **TTS 改为 Edge TTS（微软神经网络 TTS）**：服务端调用，免费无 API Key，音色自然（`zh-CN-YunxiNeural`），语速 +15%
+  - 后端 voice WebSocket 改为纯文字中转（不再处理音频字节流），职责更清晰
+  - 所有异常加 try/catch，TTS 失败时 fallback 到浏览器 SpeechSynthesis
+  - 新增文字输入 fallback 框，供不支持 SpeechRecognition 的浏览器使用
+- **改动文件**：
+  - `backend/app/api/routes/voice.py` — 重写为文字中转 WebSocket
+  - `backend/app/services/voice/edge_tts_service.py` — 新增 Edge TTS 封装
+  - `frontend/src/app/interview/page.tsx` — 重写语音面试 UI（浏览器 ASR + Edge TTS 音频播放）
+- **结论**：总延迟从「卡死」降到 2-3 秒（LLM 约 2s + TTS 约 1s）
+
+### [11:12] 语音质量 & ASR 准确率优化
+
+- **用户反馈**：
+  1. 浏览器 ASR 对专业术语识别不准（"高丝瓜""香味调制元件"等明显错误）
+  2. 语音太生硬、语速太慢（已在上条通过 Edge TTS 解决语速问题）
+- **解决方案**：
+  - **ASR 模式可选**：面试设置页新增下拉框，用户可在「浏览器识别（快速便捷）」和「云端识别（更准确，需 DashScope Key）」之间切选
+  - **Edge TTS 已在上条解决语速问题**：`zh-CN-YunxiNeural` + 语速 +15%，自然度大幅提升
+
+### [11:22] 面试反馈 & 历史记录
+
+- **做了什么**：
+  1. **面试反馈报告**：面试中新增「结束并反馈」按钮，点击后调用 LLM 生成结构化 JSON 反馈，包含：
+     - 整体评级（A/B/C/D）+ 总结
+     - 逐题问答回顾（问题 → 回答摘要 → 点评）
+     - 优势列表 + 待提升列表
+     - 专属的反馈展示页面
+  2. **面试记录持久化**：不依赖数据库，用 localStorage 存储（与个人信息同方案）
+     - 新增 `InterviewRecord` 类型和 `saveInterviewRecord / loadInterviewRecords` 工具函数
+     - 每次结束面试自动保存，最多保留 20 条
+  3. **个人信息模块新增「面试记录」Tab**：可查看所有历史记录、展开详细反馈、删除单条
+
+- **改动文件**：
+  - `frontend/src/lib/store.ts` — 新增 InterviewRecord 类型及读写函数
+  - `frontend/src/app/interview/page.tsx` — 新增反馈流程、ASR 模式选择
+  - `backend/app/api/routes/interview.py` — 新增 `/feedback` 端点
+  - `backend/app/api/routes/voice.py` — 新增 `end_interview` action 生成反馈
+  - `frontend/src/components/profile/InterviewHistory.tsx` — 新增面试历史组件
+  - `frontend/src/app/profile/page.tsx` — 新增「面试记录」Tab
+
+- **关于数据库**：当前全量使用 localStorage，16 小时挑战范围内完全够用。若后续上线，迁移路径为：localStorage → 后端 SQLite/PostgreSQL（数据模型已在 `InterviewRecord` 类型中定义好）
+
+- **结论**：面试模块形成完整闭环：设置 → 面试 → 反馈 → 历史回顾
 
 ---
 
@@ -213,7 +305,12 @@
 | 09:15 | 个人信息模块第一优先级 | 是其他模块的数据依赖，且材料生成的用户感知最强 |
 | 09:15 | 面试/专业课/机试模块先做前端框架 | 16小时内无法全部做完整，先搭骨架后续迭代 |
 | 09:35 | LLM 选用 DeepSeek API (deepseek-v4-flash) | 兼容 OpenAI 格式改动小、性价比高、中文能力强 |
-| （待补充） | | |
+| 10:30 | 面试 Pipeline: ASR+LLM+TTS 分离 | DeepSeek 推理/追问能力远强于端到端语音模型 |
+| 10:30 | ASR 选 Paraformer + TTS 选 CosyVoice | 阿里云百炼中文语音能力强、WebSocket 流式、延迟低 |
+| 10:30 | 上下文维护在后端 session | 确保语音/文字面试共享上下文，支持文件上传注入 |
+| 11:03 | ASR 改浏览器 SpeechRecognition + TTS 改 Edge TTS | 阿里云无 Key 导致 401，浏览器方案零配置、Edge TTS 免费且自然 |
+| 11:12 | ASR 模式设计为可选（浏览器/云端） | 兼顾易用性和准确率，有 DashScope Key 的用户可切换高精度模式 |
+| 11:22 | 数据持久化用 localStorage 而非数据库 | 16h 挑战范围内够用，与个人信息方案一致，迁移路径清晰 |
 
 ---
 
@@ -223,7 +320,9 @@
 |------|------------|---------|
 | Cursor Agent | 全程 | 代码生成、重构、调试 |
 | DeepSeek API (deepseek-v4-flash) | 产品核心 | 简历生成、个人陈述生成、面试官角色、反馈生成 |
-| （待补充） | | |
+| 阿里云百炼 Paraformer | 语音面试（可选高精度模式） | 实时语音识别 (ASR)，需 DashScope Key |
+| 微软 Edge TTS (edge-tts) | 语音面试 | 实时语音合成 TTS，免费、自然人声 |
+| 浏览器 SpeechRecognition | 语音面试（默认模式） | 零配置 ASR，Chrome 中文效果良好 |
 
 ---
 
@@ -231,7 +330,9 @@
 
 | 时间 | 问题描述 | 状态 |
 |------|---------|------|
-| （待填写） | | |
+| 10:00 | 远程访问前端时 API 请求指向 localhost | 已解决：动态用 window.location.hostname |
+| 11:03 | 语音面试卡死，阿里云 ASR/TTS 返回 401 | 已解决：改为浏览器 ASR + Edge TTS，无需 DashScope Key |
+| 11:12 | 浏览器 ASR 对专业术语识别不准 | 部分解决：提供云端 ASR 可选项，需用户自备 DashScope Key |
 
 ---
 
@@ -239,5 +340,5 @@
 
 - **实际完成功能**：（待填写）
 - **未完成但想做**：（待填写）
-- **刻意不做**：语音交互（文字反馈对复盘更友好）、完整账号体系（用 session 临时存储）
+- **刻意不做**：完整账号体系（用 session 临时存储）
 - **如果再给一周**：（待填写）

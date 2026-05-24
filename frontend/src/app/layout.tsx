@@ -25,6 +25,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN" className={`${geistSans.variable} ${geistMono.variable} h-full`}>
+      <head>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+      </head>
       <body className="h-full flex" suppressHydrationWarning>
         <Sidebar />
         <main className="flex-1 ml-64 overflow-auto">

@@ -67,6 +67,7 @@ async def collect_chat(
     system: str,
     user_message: str | None = None,
     messages: list[dict] | None = None,
+    timeout: float = 60.0,
 ) -> str:
     """Non-streaming LLM call, returns full response text. Used by voice pipeline."""
     if messages is None:
@@ -76,7 +77,7 @@ async def collect_chat(
 
     payload = _build_payload(system, messages, stream=False)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{LLM_API_BASE.rstrip('/')}/chat/completions",
             json=payload,

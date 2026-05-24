@@ -7,3 +7,4 @@ websockets
 python-multipart
 edge-tts
 pydub
+dashscope

@@ -67,3 +67,65 @@ export function deleteInterviewRecord(id: string): void {
   const records = loadInterviewRecords().filter((r) => r.id !== id);
   localStorage.setItem(INTERVIEW_RECORDS_KEY, JSON.stringify(records));
 }
+
+// --- Course Records ---
+
+const COURSE_RECORDS_KEY = "askme_offer_course_records";
+
+export interface CourseKnowledgeResult {
+  point: string;
+  status: "mastered" | "weak" | "not_tested";
+  score: number;
+  detail: string;
+  suggested_answer?: string;
+  wrong_answer_summary?: string;
+}
+
+export interface CourseRecord {
+  id: string;
+  date: string;
+  subject: string;
+  mode: "text" | "voice";
+  messages: { role: "user" | "assistant"; content: string }[];
+  feedback: {
+    summary: string;
+    knowledge_results: CourseKnowledgeResult[];
+    overall_score: number;
+    weak_points: string[];
+    next_focus: string;
+  } | null;
+}
+
+export function loadCourseRecords(): CourseRecord[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(COURSE_RECORDS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveCourseRecord(record: CourseRecord): void {
+  if (typeof window === "undefined") return;
+  const records = loadCourseRecords();
+  records.unshift(record);
+  if (records.length > 30) records.length = 30;
+  localStorage.setItem(COURSE_RECORDS_KEY, JSON.stringify(records));
+}
+
+export function deleteCourseRecord(id: string): void {
+  if (typeof window === "undefined") return;
+  const records = loadCourseRecords().filter((r) => r.id !== id);
+  localStorage.setItem(COURSE_RECORDS_KEY, JSON.stringify(records));
+}
+
+export interface NotebookEntry {
+  point: string;
+  subject: string;
+  questions: string[];
+  wrongAnswers: string[];
+  correctAnswer: string;
+  lastScore: number;
+  dates: string[];
+}

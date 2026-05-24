@@ -336,9 +336,72 @@
 
 ---
 
+## 第三阶段：模块全面上线（15:00 – 17:45）
+
+### [15:00] 专业课考核模块（全新）
+
+- **做了什么**：
+  1. **后端 `courses.py`**：完整课程考核 API
+     - 10 个学科 + "综合测试"覆盖全科，高等数学/线性代数/概率论必考
+     - `PointRecord` 结构追踪每个知识点的提问/错答/正答/评分/考核日期
+     - `POST /start-exam`（SSE流式）、`POST /exam-chat`、`POST /end-exam`（JSON 反馈）
+     - `POST /notebook`：返回按 weak/mastered/not_tested 分类的知识点记录
+     - `POST /ask`（SSE流式）：AI 知识点答疑，支持多轮对话和上下文
+  2. **前端 `courses/page.tsx`**：四 Tab 布局
+     - 开始考核 Tab：选科目 → AI 逐知识点追问
+     - 错题本 Tab：聚合所有历史考核中的薄弱知识点，展示错答/正答/AI 讲解按钮
+     - AI 问答 Tab：向 AI 提问知识点，支持从错题本跳转带入上下文
+     - 历史记录 Tab：查看/删除历史考核，展开查看反馈详情
+
+### [16:00] 简历生成器增强
+
+- **做了什么**：
+  1. **`ResumePreview` 组件**：Markdown → 样式化 HTML 预览，CJK 兼容字体栈，去除 backtick → code 转换
+  2. **直接导出 PDF**：html2canvas + jsPDF，`findWhitestRow()` 智能分页避免文字截断
+  3. **导出 Word (.docx)**：docx 库解析 Markdown 生成带样式文档
+  4. **UI**："美观预览/原始文本"切换，导出按钮含加载状态
+
+### [16:30] 机考训练模块（全新）
+
+- **做了什么**：
+  1. **后端 `code.py` 增强**：`stdin` 字段支持，`subprocess.run(input=stdin)` 注入标准输入
+  2. **后端 `coding.py`**：AI 出题/提示/评审 API
+     - `POST /generate`（SSE流式）：AI 生成完整程序风格算法题（含 stdin/stdout 测试用例）
+     - `POST /hint`（SSE流式）：渐进式提示（方向→思路→伪代码→片段）
+     - `POST /review`（JSON）：AI 代码评审（正确性/复杂度/Bug/标准解法/评分）
+  3. **前端 `coding/page.tsx`**：三阶段流程
+     - 设置页：选知识点(13类)/难度/语言 → 生成题目
+     - 练习页：左侧题目描述（Markdown+LaTeX），右侧代码编辑器+双Tab I/O面板
+       - 测试用例 Tab：逐一注入 stdin 精确比对 stdout
+       - 自定义输入 Tab：手动输入 stdin 即时运行
+     - 评审页：评分卡 + 四维分析 + Bug 清单 + 优化建议 + 标准解法
+  4. **历史记录**：localStorage 持久化(50条)，知识点统计
+
+### [17:00] 共享组件与基础设施
+
+- **做了什么**：
+  1. **`MarkdownContent` 组件**：react-markdown + remark-math + rehype-katex，全站 Markdown+LaTeX 渲染
+  2. **`store.ts` 增强**：新增 `CourseRecord`/`CourseKnowledgeResult`/`NotebookEntry` 类型和 CRUD
+  3. **测试数据**：`fullCourseTest.ts`（微积分+线代模拟记录）、`fullInterviewTest.ts`
+  4. **KaTeX CSS**：layout.tsx 中注入 CDN 样式表
+  5. **后端 `main.py`**：注册 code/courses/coding 三个新路由
+  6. **LLM client**：`collect_chat` 支持可配置 timeout 参数
+
+---
+
 ## 最终版本说明
 
-- **实际完成功能**：（待填写）
-- **未完成但想做**：（待填写）
-- **刻意不做**：完整账号体系（用 session 临时存储）
-- **如果再给一周**：（待填写）
+- **已完成模块**：
+  - ✅ 个人信息（Profile）— 完整表单 + Demo 数据
+  - ✅ 模拟面试（Interview）— 文字/语音双模式 + 反馈报告 + 历史记录
+  - ✅ 专业课考核（Courses）— AI 逐知识点追问 + 错题本 + AI 问答 + 综合测试
+  - ✅ 简历生成器（Resume Generator）— AI 生成 + 美观预览 + PDF/Word 导出
+  - ✅ 机考训练（Coding Test）— AI 出题 + 在线编码 + stdin 测试 + AI 评审
+
+- **刻意不做**：完整账号体系（用 localStorage 临时存储，16h 内够用）
+
+- **如果再给一周**：
+  - 数据库替换（SQLite → PostgreSQL，支持多设备同步）
+  - 机考模块接入真实 OJ 题库（爬取历年机试真题）
+  - 移动端适配（语音面试更适合手机使用）
+  - 跨模块综合分析面板（汇总各模块弱点，生成备考计划）

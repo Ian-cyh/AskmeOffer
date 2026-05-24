@@ -17,24 +17,24 @@ const MODULES = [
     href: "/interview",
     icon: MessageSquare,
     title: "模拟面试",
-    desc: "基于你的简历进行 AI 模拟面试，支持难度调节和结构化反馈",
-    status: "Demo",
+    desc: "文字/语音双模式 AI 面试，支持音色选择、手撕代码、历史汇总与追问",
+    status: "可用",
     color: "text-green-600 bg-green-50",
   },
   {
     href: "/courses",
     icon: BookOpen,
     title: "专业课",
-    desc: "针对目标院校的专业课复习路径和模拟口试",
-    status: "即将推出",
+    desc: "文字/语音双模式知识点考核，错题本、AI 答疑、知识地图全覆盖",
+    status: "可用",
     color: "text-purple-600 bg-purple-50",
   },
   {
     href: "/coding",
     icon: Code,
     title: "机试训练",
-    desc: "针对院校风格的代码练习和薄弱点分析",
-    status: "即将推出",
+    desc: "AI 出题 + 在线编译运行，代码评审与薄弱点分析",
+    status: "可用",
     color: "text-orange-600 bg-orange-50",
   },
 ];
@@ -79,7 +79,9 @@ export default function HomePage() {
                         <h3 className="font-semibold group-hover:text-primary transition-colors">
                           {m.title}
                         </h3>
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-accent text-muted">
+                        <span className={`text-xs px-2 py-0.5 rounded-full ${
+                          m.status === "可用" ? "bg-green-100 text-green-700" : "bg-accent text-muted"
+                        }`}>
                           {m.status}
                         </span>
                       </div>

@@ -96,13 +96,36 @@ COURSE_ASK_SYSTEM = """你是一位专业课辅导老师，负责解答学生关
 5. 如果学生问的是错题相关，帮助分析错误原因并给出正确理解"""
 
 
+# Cache for dynamically generated knowledge points for custom subjects
+_custom_subject_points: dict[str, list[str]] = {}
+
+CUSTOM_SUBJECT_PROMPT = """你是一位保研专业课出题专家。
+对于科目"{subject}"，请列出该科目在保研/考研面试/笔试中最常考察的核心知识点，10-15个，按重要程度排序。
+直接输出知识点列表，每行一个知识点，不要编号，不要任何其他内容。"""
+
+
+async def _get_points_for_custom_subject(subject: str) -> list[str]:
+    """Use LLM to generate knowledge points for a custom subject."""
+    if subject in _custom_subject_points:
+        return _custom_subject_points[subject]
+    system = "你是保研专业课专家，擅长梳理各学科核心考点。"
+    messages = [{"role": "user", "content": CUSTOM_SUBJECT_PROMPT.format(subject=subject)}]
+    result = await collect_chat(system, messages)
+    points = [line.strip() for line in result.strip().splitlines() if line.strip()]
+    _custom_subject_points[subject] = points[:15]
+    return _custom_subject_points[subject]
+
+
 def _get_points_for_subject(subject: str) -> list[str]:
     if subject == "综合测试":
         pts = []
         for s in ALL_SUBJECTS.values():
             pts.extend(s)
         return pts
-    return list(ALL_SUBJECTS.get(subject, []))
+    if subject in ALL_SUBJECTS:
+        return list(ALL_SUBJECTS[subject])
+    # Custom subject — use LLM-generated points (pre-populated by start_exam)
+    return list(_custom_subject_points.get(subject, []))
 
 
 def _build_points_str(subject: str, session_id: str) -> tuple[str, str]:
@@ -186,6 +209,11 @@ async def start_exam(req: ExamStartRequest):
     session_id = req.session_id or str(uuid.uuid4())
     if session_id not in _knowledge_maps:
         _knowledge_maps[session_id] = {}
+
+    # Handle custom subjects not in ALL_SUBJECTS
+    is_custom = req.subject not in ALL_SUBJECTS and req.subject != "综合测试"
+    if is_custom and req.subject not in _custom_subject_points:
+        await _get_points_for_custom_subject(req.subject)
 
     tested_str, remaining_str = _build_points_str(req.subject, session_id)
     comprehensive_note = "\n注意：这是综合测试，需要覆盖所有学科的知识点。\n" if req.subject == "综合测试" else ""

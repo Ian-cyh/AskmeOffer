@@ -62,27 +62,71 @@ interface InProgressData {
   savedAt: string;
 }
 
-type AsrMode = "browser" | "server";
 
-/** Summarise past interview records into a memory string for the backend. */
+/** Build a rich agentic memory from past interview records for the backend.
+ *  - Includes per-question weak answers so the interviewer can revisit them
+ *  - Highlights persistent weak points to guide follow-up questioning
+ */
 function buildPastMemory(): string {
-  const records = loadInterviewRecords().slice(0, 5); // last 5
+  const records = loadInterviewRecords().slice(0, 5);
   if (records.length === 0) return "";
 
-  const lines: string[] = ["以下是候选人过去模拟面试的历史记录，请据此调整提问重点："];
+  const lines: string[] = [
+    "【候选人历史面试记忆】请严格按以下指示利用历史记录：",
+    "1. 对历次面试中回答不佳或被标为「待提升」的问题，本次面试应重新考察，验证是否改进",
+    "2. 已表现出色的方向无需重复深挖，聚焦薄弱处",
+    "3. 若候选人再次回答错误，给予更具体的追问",
+    "",
+  ];
+
+  // Collect weak questions across all records
+  const weakQuestions: string[] = [];
+  const persistentWeaknesses = new Set<string>();
+
   records.forEach((r, i) => {
-    lines.push(`\n[第 ${i + 1} 次面试 — ${r.date}，难度：${r.difficulty}]`);
+    lines.push(`─── 第 ${i + 1} 次面试（${r.date}，${r.difficulty}难度）───`);
     if (r.feedback) {
-      lines.push(`总体评价：${r.feedback.summary}`);
-      lines.push(`评级：${r.feedback.overallScore}`);
+      lines.push(`整体评价：${r.feedback.summary}`);
+      lines.push(`综合评级：${r.feedback.overallScore}`);
       if (r.feedback.strengths?.length) {
-        lines.push(`优势：${r.feedback.strengths.join("；")}`);
+        lines.push(`✓ 优势：${r.feedback.strengths.slice(0, 3).join("；")}`);
       }
       if (r.feedback.improvements?.length) {
-        lines.push(`待提升：${r.feedback.improvements.join("；")}`);
+        r.feedback.improvements.forEach(w => persistentWeaknesses.add(w));
+        lines.push(`✗ 待提升：${r.feedback.improvements.join("；")}`);
+      }
+      if (r.feedback.expression_summary) {
+        lines.push(`表达点评：${r.feedback.expression_summary}`);
+      }
+      // Per-question details — focus on low score / weak answers
+      if (r.feedback.questions?.length) {
+        const weakQs = r.feedback.questions.filter(q =>
+          (q.score != null && q.score < 75) ||
+          q.evaluation?.includes("待提升") ||
+          q.evaluation?.includes("不足") ||
+          q.evaluation?.includes("错误")
+        );
+        if (weakQs.length > 0) {
+          lines.push("  ⚠ 回答薄弱的问题（本次应重新考察）：");
+          weakQs.forEach(q => {
+            const entry = `    问题：「${q.question}」 | 当时回答：${q.answer?.slice(0, 60)}... | 评价：${q.evaluation}`;
+            lines.push(entry);
+            weakQuestions.push(q.question);
+          });
+        }
       }
     }
+    lines.push("");
   });
+
+  if (persistentWeaknesses.size > 0) {
+    lines.push(`【跨次持续薄弱点——本次务必重点考察】：${[...persistentWeaknesses].join("；")}`);
+  }
+  if (weakQuestions.length > 0) {
+    lines.push(`【历次未答好的问题列表——应在合适时机重新提问】：`);
+    weakQuestions.slice(0, 8).forEach((q, i) => lines.push(`  ${i + 1}. ${q}`));
+  }
+
   return lines.join("\n");
 }
 
@@ -90,7 +134,7 @@ export default function InterviewPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [difficulty, setDifficulty] = useState("standard");
-  const [asrMode, setAsrMode] = useState<AsrMode>("browser");
+
   const [ttsVoice, setTtsVoice] = useState("zh-CN-YunxiNeural");
   const [interviewerInfo, setInterviewerInfo] = useState("");
   const [loading, setLoading] = useState(false);
@@ -157,11 +201,20 @@ export default function InterviewPage() {
     try { localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify(data)); } catch { /* ignore */ }
   }, [messages, started, showFeedback, sessionId, difficulty, mode, ttsVoice, interviewerInfo]);
 
-  // Pause audio when user switches away from the page
+  // Pause audio & stop recording when user switches away from the page
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === "hidden" && _currentAudio) {
-        _currentAudio.pause();
+      if (document.visibilityState === "hidden") {
+        if (_currentAudio) _currentAudio.pause();
+        // Stop any ongoing recording
+        if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+        if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+        recognitionRef.current?.stop();
+        setListening(false);
+        setSpeaking(false);
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
@@ -381,7 +434,15 @@ export default function InterviewPage() {
     wsRef.current = ws;
 
     let audioChunks: Blob[] = [];
-    const finishSpeaking = () => { setSpeaking(false); setVoiceStatus("点击麦克风按钮开始回答"); };
+    const finishSpeaking = () => {
+      setSpeaking(false);
+      if (autoListenRef.current && !document.hidden) {
+        // Auto-start recording after TTS finishes
+        setTimeout(() => startServerASR(true), 300);
+      } else {
+        setVoiceStatus("点击麦克风按钮开始回答");
+      }
+    };
 
     ws.onmessage = (event) => {
       if (event.data instanceof Blob) { audioChunks.push(event.data); return; }
@@ -422,9 +483,15 @@ export default function InterviewPage() {
   // Refs for MediaRecorder (server ASR mode)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const silenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Auto-listen: start recording automatically after TTS audio ends
+  const autoListenRef = useRef(true);
 
-  /** Stop any active recording/recognition */
+  /** Stop any active recording/recognition and clean up silence detector */
   const stopListening = () => {
+    if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
     recognitionRef.current?.stop();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
@@ -476,8 +543,10 @@ export default function InterviewPage() {
     recognition.start(); setListening(true); setVoiceStatus("正在听...");
   };
 
-  /** Paraformer server-side ASR: record with MediaRecorder → POST to backend → get text */
-  const startServerASR = async () => {
+  /** Paraformer server-side ASR: record with MediaRecorder → POST to backend → get text.
+   *  When autoSilence=true, uses Web Audio API to auto-stop after 2s of silence. */
+  const startServerASR = async (autoSilence = false) => {
+    if (listening) return; // guard against double-start
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -501,11 +570,14 @@ export default function InterviewPage() {
     };
 
     recorder.onstop = async () => {
+      // cleanup silence detector
+      if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+      if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
       stream.getTracks().forEach((t) => t.stop());
       setListening(false);
 
       const blob = new Blob(audioChunksRef.current, { type: mimeType });
-      if (blob.size < 1000) { setVoiceStatus("未检测到音频，请重试"); return; }
+      if (blob.size < 1000) { setVoiceStatus(autoSilence ? "未检测到音频，请再试" : "未检测到音频，请重试"); return; }
 
       setVoiceStatus("上传音频识别中 (Paraformer)...");
       try {
@@ -525,19 +597,69 @@ export default function InterviewPage() {
       }
     };
 
-    recorder.start(200); // collect data every 200ms
+    recorder.start(200);
     setListening(true);
-    setVoiceStatus("Paraformer 录音中... 点击停止");
+    setVoiceStatus(autoSilence ? "🎙 自动录音中... 2秒静音后自动提交" : "Paraformer 录音中... 点击停止");
+
+    // --- Silence detection via Web Audio API ---
+    if (autoSilence) {
+      try {
+        const audioCtx = new AudioContext();
+        audioCtxRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.fftSize);
+
+        const SILENCE_THRESHOLD = 8;   // amplitude RMS below this = silence
+        const SILENCE_MS = 2000;       // 2 seconds
+        let silenceStart: number | null = null;
+        let hasSpoken = false;         // wait for at least some speech first
+
+        silenceIntervalRef.current = setInterval(() => {
+          if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+            if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+            return;
+          }
+          analyser.getByteTimeDomainData(dataArray);
+          const rms = Math.sqrt(
+            dataArray.reduce((acc, v) => acc + (v - 128) * (v - 128), 0) / dataArray.length
+          );
+
+          if (rms >= SILENCE_THRESHOLD) {
+            hasSpoken = true;
+            silenceStart = null;
+            setVoiceStatus("🎙 录音中... 检测到声音");
+          } else if (hasSpoken) {
+            if (silenceStart === null) silenceStart = Date.now();
+            const silenced = Date.now() - silenceStart;
+            if (silenced >= SILENCE_MS) {
+              // Auto stop
+              if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+              const rec = mediaRecorderRef.current;
+              if (rec && (rec.state === "recording" || rec.state === "paused")) {
+                setVoiceStatus("检测到静音，自动提交中...");
+                rec.stop();
+              }
+            } else {
+              const sec = ((SILENCE_MS - silenced) / 1000).toFixed(1);
+              setVoiceStatus(`🔇 ${sec}s 后自动提交...`);
+            }
+          }
+          // If !hasSpoken yet, just wait (show initial status)
+        }, 100);
+      } catch {
+        // AudioContext not supported — fall back to manual stop
+      }
+    }
   };
 
   const toggleListening = () => {
     if (speaking) return;
     if (listening) { stopListening(); return; }
-    if (asrMode === "server") {
-      startServerASR();
-    } else {
-      startBrowserASR();
-    }
+    // Always use server-side Paraformer ASR in voice mode
+    startServerASR(false); // manual trigger — no auto silence detection
   };
 
   const reset = () => {
@@ -545,6 +667,8 @@ export default function InterviewPage() {
     setVoiceStatus(""); setSpeaking(false); setListening(false);
     setShowFeedback(false); setFeedback(null); setGeneratingFeedback(false);
     setShowCodePanel(false); setCodeChallenge(null); setUserCode(""); setCodeReview("");
+    if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
     recognitionRef.current?.stop();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
@@ -722,11 +846,63 @@ export default function InterviewPage() {
               <textarea
                 value={interviewerInfo}
                 onChange={(e) => setInterviewerInfo(e.target.value)}
-                placeholder="例如：北京大学计算机学院张伟教授，研究方向为深度学习与计算机视觉，主页：cs.pku.edu.cn/~zhangwei"
+                placeholder="例如：北京大学计算机学院张伟教授，研究方向为深度学习与计算机视觉"
                 className="w-full px-3 py-2 rounded-lg border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary resize-none"
                 rows={2}
               />
               <p className="text-xs text-muted mt-1">填写目标导师信息后，AI 将模拟该导师进行面试</p>
+              {/* URL auto-parse */}
+              <div className="flex gap-2 mt-2">
+                <input
+                  id="professor-url-input"
+                  type="url"
+                  placeholder="粘贴导师主页 URL，自动解析信息..."
+                  className="flex-1 px-3 py-1.5 rounded-lg border border-border text-xs focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                />
+                <button
+                  onClick={async () => {
+                    const inp = (document.getElementById("professor-url-input") as HTMLInputElement);
+                    const url = inp?.value?.trim();
+                    if (!url) return;
+                    setInterviewerInfo("正在解析主页，请稍候...");
+                    const API = `http://${window.location.hostname}:8000`;
+
+                    // Step 1: try to fetch the page HTML from the browser
+                    let pageText = "";
+                    try {
+                      const pageRes = await fetch(url, { mode: "cors", signal: AbortSignal.timeout(8000) });
+                      const html = await pageRes.text();
+                      // Strip HTML tags in JS
+                      const tmp = document.createElement("div");
+                      tmp.innerHTML = html;
+                      // Remove scripts and styles
+                      tmp.querySelectorAll("script,style").forEach(el => el.remove());
+                      pageText = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ").trim().slice(0, 4000);
+                    } catch {
+                      // CORS or network error — send URL only, backend will use LLM knowledge
+                      pageText = "";
+                    }
+
+                    // Step 2: send to backend for LLM extraction
+                    try {
+                      const res = await fetch(`${API}/api/interview/fetch_professor`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ url, page_text: pageText }),
+                      });
+                      const data = await res.json();
+                      if (data.error) { setInterviewerInfo(""); alert(`解析失败：${data.error}`); }
+                      else setInterviewerInfo(data.info || "");
+                    } catch (e) {
+                      setInterviewerInfo("");
+                      alert(`请求失败：${e}`);
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-primary text-white text-xs font-medium hover:opacity-90 transition-opacity whitespace-nowrap"
+                >
+                  解析主页
+                </button>
+              </div>
             </div>
 
             <div>
@@ -765,61 +941,126 @@ export default function InterviewPage() {
   if (mode === "voice") {
     return (
       <div className="h-full flex flex-col">
-        <div className="p-6 pb-0 flex items-center justify-between">
+        {/* Header */}
+        <div className="p-4 pb-0 flex items-center justify-between border-b border-border/50">
           <div>
-            <h1 className="text-lg font-bold flex items-center gap-2">
-              <Volume2 size={18} className="text-primary" /> 语音面试中
+            <h1 className="text-base font-bold flex items-center gap-2">
+              <Volume2 size={16} className="text-primary" /> 语音面试中
             </h1>
             <p className="text-xs text-muted">
               难度：{difficulty === "easy" ? "简单" : difficulty === "standard" ? "标准" : "压力面"}
               {" · "}Paraformer 云端识别
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 pb-1">
+            {messages.length >= 4 && !showCodePanel && (
+              <Button variant="secondary" size="sm" onClick={requestCodeChallenge} disabled={loadingChallenge}>
+                <Code2 size={13} /> {loadingChallenge ? "出题中..." : "手撕代码"}
+              </Button>
+            )}
             <Button variant="secondary" size="sm" onClick={endInterview} disabled={generatingFeedback || messages.length < 2}>
-              <FileText size={14} /> {generatingFeedback ? "生成反馈中..." : "结束并反馈"}
+              <FileText size={13} /> {generatingFeedback ? "生成反馈中..." : "结束并反馈"}
             </Button>
           </div>
         </div>
 
-        <div ref={scrollRef} className="flex-1 overflow-auto p-6 space-y-4">
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
-                msg.role === "user" ? "bg-primary text-white rounded-br-md" : "bg-accent text-foreground rounded-bl-md"
-              }`}>{msg.content}</div>
+        {/* Body: split when code panel open */}
+        <div className={`flex flex-1 overflow-hidden`}>
+          {/* Chat + mic column */}
+          <div className={`flex flex-col ${showCodePanel ? "w-1/2 border-r border-border" : "w-full"}`}>
+            <div ref={scrollRef} className="flex-1 overflow-auto p-4 space-y-3">
+              {messages.map((msg, i) => (
+                <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                    msg.role === "user" ? "bg-primary text-white rounded-br-md" : "bg-accent text-foreground rounded-bl-md"
+                  }`}>{msg.content}</div>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
 
-        <div className="p-4 border-t border-border bg-white">
-          <div className="flex flex-col items-center gap-3 mb-3">
-            <p className="text-sm text-muted">{voiceStatus}</p>
-            <button onClick={toggleListening} disabled={speaking}
-              className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${
-                speaking ? "bg-gray-300 text-gray-500 cursor-not-allowed" :
-                listening ? "bg-red-500 text-white animate-pulse scale-110" : "bg-primary text-white hover:opacity-90"
-              }`}>
-              {listening ? <MicOff size={28} /> : <Mic size={28} />}
-            </button>
-            <p className="text-xs text-muted">
-              {speaking ? "面试官正在说话..." : listening ? "Paraformer 录音中... 再次点击停止并识别" : "点击开始回答"}
-            </p>
+            <div className="p-4 border-t border-border bg-white">
+              <div className="flex flex-col items-center gap-2 mb-2">
+                <p className="text-xs text-muted text-center">{voiceStatus || (speaking ? "面试官正在说话..." : "等待开始...")}</p>
+                <button onClick={toggleListening} disabled={speaking}
+                  className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
+                    speaking ? "bg-gray-300 text-gray-500 cursor-not-allowed" :
+                    listening ? "bg-red-500 text-white animate-pulse scale-110" : "bg-primary text-white hover:opacity-90"
+                  }`}>
+                  {listening ? <MicOff size={24} /> : <Mic size={24} />}
+                </button>
+                <div className="flex items-center gap-2">
+                  <p className="text-xs text-muted">
+                    {speaking ? "面试官正在说话..." : listening ? "录音中... 点击停止" : "点击开始回答"}
+                  </p>
+                  <button
+                    title={autoListenRef.current ? "自动接听已开启（面试官说完自动录音）" : "自动接听已关闭（需手动点击）"}
+                    onClick={() => { autoListenRef.current = !autoListenRef.current; setVoiceStatus(autoListenRef.current ? "✅ 自动接听已开启" : "⭕ 自动接听已关闭"); }}
+                    className="text-xs px-2 py-0.5 rounded border border-border text-muted hover:border-primary hover:text-primary transition-colors"
+                  >
+                    {autoListenRef.current ? "自动●" : "手动○"}
+                  </button>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <input value={input} onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey && input.trim() && !speaking) {
+                      wsRef.current?.send(JSON.stringify({ action: "user_text", text: input.trim() }));
+                      setInput("");
+                    }
+                  }}
+                  placeholder="也可以打字回答..." disabled={speaking}
+                  className="flex-1 px-3 py-2 rounded-xl border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                <Button size="sm" disabled={speaking || !input.trim()} onClick={() => {
+                  if (input.trim()) { wsRef.current?.send(JSON.stringify({ action: "user_text", text: input.trim() })); setInput(""); }
+                }}><Send size={14} /></Button>
+              </div>
+            </div>
           </div>
-          <div className="flex gap-2 max-w-3xl mx-auto">
-            <input value={input} onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && input.trim() && !speaking) {
-                  wsRef.current?.send(JSON.stringify({ action: "user_text", text: input.trim() }));
-                  setInput("");
-                }
-              }}
-              placeholder="也可以打字回答..." disabled={speaking}
-              className="flex-1 px-4 py-2 rounded-xl border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-            <Button size="sm" disabled={speaking || !input.trim()} onClick={() => {
-              if (input.trim()) { wsRef.current?.send(JSON.stringify({ action: "user_text", text: input.trim() })); setInput(""); }
-            }}><Send size={14} /></Button>
-          </div>
+
+          {/* Code panel column */}
+          {showCodePanel && (
+            <div className="w-1/2 flex flex-col overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-accent/30">
+                <span className="text-sm font-medium flex items-center gap-1.5"><Code2 size={14} /> 手撕代码</span>
+                <button onClick={() => setShowCodePanel(false)} className="text-muted hover:text-foreground"><X size={16} /></button>
+              </div>
+              <div className="flex-1 overflow-auto p-4 space-y-4">
+                {loadingChallenge ? (
+                  <div className="text-center py-12 text-muted text-sm">正在生成题目...</div>
+                ) : codeChallenge ? (
+                  <>
+                    <div className="bg-white rounded-lg border border-border p-4 space-y-2">
+                      <div className="font-semibold text-sm">{codeChallenge.title}</div>
+                      <div className="text-sm text-muted whitespace-pre-wrap">{codeChallenge.description}</div>
+                      {codeChallenge.examples.map((ex, i) => (
+                        <div key={i} className="bg-gray-50 rounded p-2 text-xs font-mono space-y-1">
+                          <div className="text-gray-500">输入：</div>
+                          <div className="whitespace-pre">{ex.input}</div>
+                          <div className="text-gray-500 mt-1">输出：</div>
+                          <div className="whitespace-pre">{ex.output}</div>
+                          {ex.explanation && <div className="text-gray-400 mt-1">说明：{ex.explanation}</div>}
+                        </div>
+                      ))}
+                    </div>
+                    <CodeEditor value={userCode} onChange={setUserCode} language={codeChallenge.language} minHeight="200px" />
+                    <div className="flex gap-2">
+                      <Button onClick={submitCode} disabled={loadingReview || !userCode.trim()}>
+                        {loadingReview ? "评审中..." : "提交代码"}
+                      </Button>
+                      <Button variant="secondary" onClick={requestCodeChallenge} disabled={loadingChallenge}>换一题</Button>
+                    </div>
+                    {codeReview && (
+                      <div className="bg-white rounded-lg border border-border p-4">
+                        <div className="text-sm font-medium mb-2">面试官点评：</div>
+                        <div className="text-sm"><MarkdownContent content={codeReview} /></div>
+                      </div>
+                    )}
+                  </>
+                ) : null}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );

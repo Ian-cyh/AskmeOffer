@@ -63,9 +63,8 @@ export function loadInterviewRecords(): InterviewRecord[] {
 
 export function saveInterviewRecord(record: InterviewRecord): void {
   if (typeof window === "undefined") return;
-  const records = loadInterviewRecords();
+  const records = loadInterviewRecords().filter((r) => r.id !== record.id);
   records.unshift(record);
-  // Keep last 20 records
   if (records.length > 20) records.length = 20;
   localStorage.setItem(INTERVIEW_RECORDS_KEY, JSON.stringify(records));
 }
@@ -118,7 +117,7 @@ export function loadCourseRecords(): CourseRecord[] {
 
 export function saveCourseRecord(record: CourseRecord): void {
   if (typeof window === "undefined") return;
-  const records = loadCourseRecords();
+  const records = loadCourseRecords().filter((r) => r.id !== record.id);
   records.unshift(record);
   if (records.length > 30) records.length = 30;
   localStorage.setItem(COURSE_RECORDS_KEY, JSON.stringify(records));

@@ -15,7 +15,7 @@ import { FULL_COURSE_TEST_RECORDS } from "@/lib/fullCourseTest";
 import {
   Play, Send, RotateCcw, BookOpen, Trash2, ChevronDown, ChevronUp,
   CheckCircle, XCircle, AlertTriangle, HelpCircle, History, MessageSquare,
-  Lightbulb, FileText, Map,
+  Lightbulb, FileText, Map, Mic, MicOff, Volume2,
 } from "lucide-react";
 
 const API_BASE = () =>
@@ -28,7 +28,12 @@ const SUBJECTS = [
   "数据结构", "计算机网络", "操作系统",
   "数字电路", "模拟电路", "信号与系统", "通信原理",
   "综合测试",
+  "__custom__",
 ];
+
+const SUBJECT_LABELS: Record<string, string> = {
+  "__custom__": "自定义科目...",
+};
 
 type SetupTab = "exam" | "progress" | "notebook" | "ask" | "history";
 
@@ -72,6 +77,9 @@ function buildNotebookFromRecords(records: CourseRecord[]): NotebookEntry[] {
 export default function CoursesPage() {
   const [setupTab, setSetupTab] = useState<SetupTab>("exam");
   const [subject, setSubject] = useState("高等数学/微积分");
+  const [customSubject, setCustomSubject] = useState("");
+  // effective subject used in API calls
+  const effectiveSubject = subject === "__custom__" ? customSubject.trim() : subject;
   const [phase, setPhase] = useState<"setup" | "exam" | "feedback">("setup");
 
   const [messages, setMessages] = useState<Message[]>([]);
@@ -94,6 +102,20 @@ export default function CoursesPage() {
   const [askContext, setAskContext] = useState("");
 
   const [knowledgeMap, setKnowledgeMap] = useState<Record<string, SubjectProgress>>({});
+
+  // Voice exam state
+  const [examMode, setExamMode] = useState<"text" | "voice">("text");
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("");
+  const [examTtsVoice, setExamTtsVoice] = useState("zh-CN-YunxiNeural");
+  const [examSpeaking, setExamSpeaking] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const silenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const examAudioRef = useRef<HTMLAudioElement | null>(null);
+  // auto-start recording after AI finishes responding (voice mode)
+  const autoListenRef = useRef(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -123,6 +145,21 @@ export default function CoursesPage() {
 
   useEffect(() => { refreshNotebook(); fetchKnowledgeMap(); }, []);
 
+  // Pause audio & stop recording when user switches away
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        if (examAudioRef.current) { examAudioRef.current.pause(); setExamSpeaking(false); }
+        if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+        if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+        if (mediaRecorderRef.current?.state !== "inactive") mediaRecorderRef.current?.stop();
+        setVoiceListening(false);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
   const loadFullCourseTest = () => {
     const existing = loadCourseRecords();
     const existingIds = new Set(existing.map(r => r.id));
@@ -136,8 +173,156 @@ export default function CoursesPage() {
     setSetupTab("history");
   };
 
+  /** Play text via Edge TTS for the exam voice mode */
+  const speakExamText = async (text: string) => {
+    if (examMode !== "voice") return;
+    try {
+      setExamSpeaking(true);
+      setVoiceStatus("考官正在说话...");
+      const res = await fetch(`${API_BASE()}/api/voice/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: examTtsVoice }),
+      });
+      if (!res.ok) throw new Error("TTS request failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      examAudioRef.current = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        examAudioRef.current = null;
+        setExamSpeaking(false);
+        setVoiceStatus("");
+        if (autoListenRef.current && !document.hidden) {
+          setTimeout(() => startVoiceASR(true), 300);
+        }
+      };
+      audio.onerror = () => { setExamSpeaking(false); setVoiceStatus(""); };
+      audio.play().catch(() => { setExamSpeaking(false); setVoiceStatus(""); });
+    } catch {
+      setExamSpeaking(false);
+      setVoiceStatus("");
+    }
+  };
+
+  // --- Voice ASR for exam (with VAD) ---
+  const stopVoiceListening = () => {
+    if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    const rec = mediaRecorderRef.current;
+    if (rec && (rec.state === "recording" || rec.state === "paused")) rec.stop();
+    setVoiceListening(false);
+  };
+
+  /** Start recording with optional 2-second silence auto-stop.
+   *  When autoSilence=true, auto-send after ASR (no manual click needed). */
+  const startVoiceASR = async (autoSilence = false) => {
+    if (voiceListening) return;
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      alert("请允许麦克风权限");
+      return;
+    }
+    audioChunksRef.current = [];
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus" : "audio/webm";
+    const recorder = new MediaRecorder(stream, { mimeType });
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+
+    recorder.onstop = async () => {
+      if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+      if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+      stream.getTracks().forEach(t => t.stop());
+      setVoiceListening(false);
+
+      const blob = new Blob(audioChunksRef.current, { type: mimeType });
+      if (blob.size < 1000) { setVoiceStatus("未检测到音频，请重试"); return; }
+      setVoiceStatus("上传识别中 (Paraformer)...");
+      try {
+        const formData = new FormData();
+        formData.append("audio", blob, "recording.webm");
+        const res = await fetch(`${API_BASE()}/api/voice/asr`, { method: "POST", body: formData });
+        if (!res.ok) throw new Error(await res.text());
+        const { text } = await res.json();
+        if (!text?.trim()) { setVoiceStatus("未识别到内容，请重试"); return; }
+        setVoiceStatus(`识别完成：${text}`);
+        if (autoSilence) {
+          // auto-send without user needing to click
+          setInput(text.trim());
+          // trigger send on next tick
+          setTimeout(() => sendExamMessageWithText(text.trim()), 50);
+        } else {
+          setInput(text.trim());
+        }
+      } catch (e) {
+        setVoiceStatus(`识别失败：${e}`);
+      }
+    };
+
+    recorder.start(200);
+    setVoiceListening(true);
+    setVoiceStatus(autoSilence ? "🎙 自动录音中... 2秒静音后自动提交" : "录音中... 点击停止");
+
+    // VAD silence detection
+    if (autoSilence) {
+      try {
+        const audioCtx = new AudioContext();
+        audioCtxRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.fftSize);
+        const THRESHOLD = 8;
+        const SILENCE_MS = 2000;
+        let silenceStart: number | null = null;
+        let hasSpoken = false;
+
+        silenceIntervalRef.current = setInterval(() => {
+          if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+            if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+            return;
+          }
+          analyser.getByteTimeDomainData(dataArray);
+          const rms = Math.sqrt(dataArray.reduce((acc, v) => acc + (v - 128) * (v - 128), 0) / dataArray.length);
+          if (rms >= THRESHOLD) {
+            hasSpoken = true; silenceStart = null;
+            setVoiceStatus("🎙 录音中... 检测到声音");
+          } else if (hasSpoken) {
+            if (silenceStart === null) silenceStart = Date.now();
+            const elapsed = Date.now() - silenceStart;
+            if (elapsed >= SILENCE_MS) {
+              if (silenceIntervalRef.current) { clearInterval(silenceIntervalRef.current); silenceIntervalRef.current = null; }
+              const rec = mediaRecorderRef.current;
+              if (rec && (rec.state === "recording" || rec.state === "paused")) {
+                setVoiceStatus("检测到静音，自动提交中...");
+                rec.stop();
+              }
+            } else {
+              setVoiceStatus(`🔇 ${((SILENCE_MS - elapsed) / 1000).toFixed(1)}s 后自动提交...`);
+            }
+          }
+        }, 100);
+      } catch { /* AudioContext not supported, fall back */ }
+    }
+  };
+
+  const toggleVoiceListening = () => {
+    if (voiceListening) { stopVoiceListening(); return; }
+    startVoiceASR(false); // manual tap — no auto-send
+  };
+
   // --- Exam ---
   const startExam = async () => {
+    if (subject === "__custom__" && !customSubject.trim()) {
+      alert("请输入自定义科目名称");
+      return;
+    }
     const sid = crypto.randomUUID();
     setSessionId(sid);
     setPhase("exam");
@@ -149,9 +334,12 @@ export default function CoursesPage() {
     try {
       await fetchStream(
         "/api/courses/start-exam",
-        { subject, session_id: sid },
+        { subject: effectiveSubject, session_id: sid },
         (chunk) => { content += chunk; setMessages([{ role: "assistant", content }]); },
-        () => setLoading(false),
+        () => {
+          setLoading(false);
+          if (examMode === "voice") speakExamText(content);
+        },
       );
     } catch {
       setMessages([{ role: "assistant", content: "考核启动失败，请确认后端服务已启动。" }]);
@@ -159,13 +347,13 @@ export default function CoursesPage() {
     }
   };
 
-  const sendExamMessage = async () => {
-    if (!input.trim() || loading) return;
-    const userMsg = input.trim();
+  const sendExamMessageWithText = async (userMsg: string) => {
+    if (!userMsg.trim() || loading) return;
     setInput("");
     const newMessages: Message[] = [...messages, { role: "user", content: userMsg }];
     setMessages(newMessages);
     setLoading(true);
+    setVoiceStatus("");
 
     let content = "";
     try {
@@ -173,13 +361,20 @@ export default function CoursesPage() {
         "/api/courses/exam-chat",
         { session_id: sessionId, user_message: userMsg },
         (chunk) => { content += chunk; setMessages([...newMessages, { role: "assistant", content }]); },
-        () => setLoading(false),
+        () => {
+          setLoading(false);
+          if (examMode === "voice") {
+            speakExamText(content);
+          }
+        },
       );
     } catch {
       setMessages([...newMessages, { role: "assistant", content: "回复失败，请重试。" }]);
       setLoading(false);
     }
   };
+
+  const sendExamMessage = () => sendExamMessageWithText(input.trim());
 
   const endExam = async () => {
     setGeneratingFeedback(true);
@@ -195,8 +390,8 @@ export default function CoursesPage() {
         const record: CourseRecord = {
           id: sessionId,
           date: new Date().toLocaleString("zh-CN"),
-          subject,
-          mode: "text",
+          subject: effectiveSubject,
+          mode: examMode,
           messages: [...messages],
           feedback: data.feedback,
         };
@@ -350,10 +545,15 @@ export default function CoursesPage() {
   if (phase === "exam") {
     return (
       <div className="h-full flex flex-col">
-        <div className="p-6 pb-0 flex items-center justify-between">
+        <div className="p-4 pb-0 flex items-center justify-between border-b border-border/50">
           <div>
-            <h1 className="text-lg font-bold">{subject} 考核中</h1>
-            <p className="text-xs text-muted">回答问题，考官会逐步深入</p>
+            <h1 className="text-base font-bold flex items-center gap-2">
+              {examMode === "voice" ? <Volume2 size={15} className="text-primary" /> : null}
+              {effectiveSubject} 考核中
+            </h1>
+            <p className="text-xs text-muted">
+              {examMode === "voice" ? "语音模式 · Paraformer 识别" : "文字模式"} · 回答问题，考官会逐步深入
+            </p>
           </div>
           <Button variant="secondary" size="sm" onClick={endExam} disabled={generatingFeedback || messages.length < 2}>
             <FileText size={14} /> {generatingFeedback ? "生成反馈中..." : "结束并反馈"}
@@ -372,12 +572,34 @@ export default function CoursesPage() {
           ))}
         </div>
         <div className="p-4 border-t border-border bg-white">
+          {examMode === "voice" && (
+            <div className="flex flex-col items-center gap-2 mb-3">
+              <p className="text-xs text-muted text-center">
+                {examSpeaking ? "🔊 考官正在说话..." : voiceStatus || (loading ? "考官思考中..." : "等待录音...")}
+              </p>
+              <button onClick={toggleVoiceListening} disabled={loading || examSpeaking}
+                className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
+                  loading || examSpeaking ? "bg-gray-200 text-gray-400 cursor-not-allowed" :
+                  voiceListening ? "bg-red-500 text-white animate-pulse scale-110" : "bg-primary text-white hover:opacity-90"
+                }`}>
+                {voiceListening ? <MicOff size={20} /> : <Mic size={20} />}
+              </button>
+              <button
+                title={autoListenRef.current ? "自动接听已开启" : "自动接听已关闭"}
+                onClick={() => { autoListenRef.current = !autoListenRef.current; setVoiceStatus(autoListenRef.current ? "✅ 自动接听已开启" : "⭕ 已切换为手动模式"); }}
+                className="text-xs px-2 py-0.5 rounded border border-border text-muted hover:border-primary hover:text-primary transition-colors"
+              >
+                {autoListenRef.current ? "自动●" : "手动○"}
+              </button>
+            </div>
+          )}
           <div className="flex gap-2 max-w-4xl mx-auto">
             <input value={input} onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendExamMessage()}
-              placeholder="输入你的回答..." disabled={loading}
+              placeholder={examMode === "voice" ? "语音识别结果（可编辑后发送）..." : "输入你的回答..."}
+              disabled={loading || examSpeaking}
               className="flex-1 px-4 py-3 rounded-xl border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-            <Button onClick={sendExamMessage} disabled={loading || !input.trim()}>
+            <Button onClick={sendExamMessage} disabled={loading || examSpeaking || !input.trim()}>
               <Send size={16} />
             </Button>
           </div>
@@ -415,9 +637,60 @@ export default function CoursesPage() {
             <div>
               <label className="block text-sm font-medium mb-1.5">考核科目</label>
               <Select value={subject} onChange={e => setSubject(e.target.value)}>
-                {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                {SUBJECTS.map(s => (
+                  <option key={s} value={s}>{SUBJECT_LABELS[s] ?? s}</option>
+                ))}
               </Select>
-              <p className="text-xs text-muted mt-1">无论选择什么学科，高等数学、线性代数、概率论必考</p>
+              {subject === "__custom__" && (
+                <input
+                  value={customSubject}
+                  onChange={e => setCustomSubject(e.target.value)}
+                  placeholder="输入科目名称，如：计算机组成原理、机器学习、量子力学..."
+                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                />
+              )}
+              <p className="text-xs text-muted mt-1">
+                {subject === "__custom__"
+                  ? "AI 将根据科目名称自动生成核心知识点并逐一考察"
+                  : "无论选择什么学科，高等数学、线性代数、概率论必考"}
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1.5">考核模式</label>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setExamMode("text")}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg border text-sm font-medium transition ${
+                    examMode === "text" ? "border-primary bg-primary/5 text-primary" : "border-border text-muted hover:border-primary/50"
+                  }`}
+                >
+                  <FileText size={14} /> 文字考核
+                </button>
+                <button
+                  onClick={() => setExamMode("voice")}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg border text-sm font-medium transition ${
+                    examMode === "voice" ? "border-primary bg-primary/5 text-primary" : "border-border text-muted hover:border-primary/50"
+                  }`}
+                >
+                  <Mic size={14} /> 语音考核
+                </button>
+              </div>
+              {examMode === "voice" && (
+                <div className="mt-2 space-y-2">
+                  <p className="text-xs text-muted">使用阿里云 Paraformer 录音，考官语音自动播放，2秒静音自动提交</p>
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1">考官音色</label>
+                    <select value={examTtsVoice} onChange={e => setExamTtsVoice(e.target.value)}
+                      className="w-full px-2 py-1.5 text-sm border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20">
+                      <option value="zh-CN-YunxiNeural">云希（温和男声）</option>
+                      <option value="zh-CN-YunjianNeural">云健（严肃男声）</option>
+                      <option value="zh-CN-YunyangNeural">云扬（播报男声）</option>
+                      <option value="zh-CN-XiaoxiaoNeural">晓晓（活泼女声）</option>
+                      <option value="zh-CN-XiaoyiNeural">晓伊（温柔女声）</option>
+                    </select>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="flex gap-3">
               <Button onClick={startExam}><Play size={14} /> 开始考核</Button>
@@ -605,9 +878,10 @@ export default function CoursesPage() {
               >
                 <div>
                   <div className="font-medium text-sm">{r.subject}</div>
-                  <div className="text-xs text-muted mt-0.5">
+                  <div className="text-xs text-muted mt-0.5 flex items-center gap-1.5">
                     {r.date} · {r.feedback?.overall_score ?? "-"}分 ·{" "}
                     {r.feedback?.knowledge_results?.length ?? 0} 个知识点
+                    {r.mode === "voice" && <span className="inline-flex items-center gap-0.5 text-primary"><Mic size={10} />语音</span>}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
